@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -159,9 +160,14 @@ func eventsHandler(w http.ResponseWriter, r *http.Request, writers map[string]*k
 		http.Error(w, "unknown event kind", http.StatusBadRequest)
 		return
 	}
+	writer := writers[kind]
+	if writer == nil {
+		http.Error(w, "kafka writer not configured for kind", http.StatusInternalServerError)
+		return
+	}
 
-	// читаем payload как raw JSON (может быть пустым)
 	var raw json.RawMessage
+	var body []byte
 	if r.Body != nil {
 		defer r.Body.Close()
 		b, err := ioReadAllLimit(r.Body, 1<<20) // 1 MiB
@@ -173,13 +179,17 @@ func eventsHandler(w http.ResponseWriter, r *http.Request, writers map[string]*k
 			http.Error(w, "read error", http.StatusBadRequest)
 			return
 		}
-		if len(strings.TrimSpace(string(b))) > 0 {
-			raw = json.RawMessage(b)
-		} else {
-			raw = json.RawMessage("{}")
-		}
+		body = bytes.TrimSpace(b)
+	}
+
+	if len(body) == 0 {
+		raw = json.RawMessage(`{}`)
 	} else {
-		raw = json.RawMessage("{}")
+		if !json.Valid(body) {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		raw = json.RawMessage(body)
 	}
 
 	e := Event{
@@ -188,14 +198,26 @@ func eventsHandler(w http.ResponseWriter, r *http.Request, writers map[string]*k
 		Timestamp: time.Now().UTC(),
 		Payload:   raw,
 	}
-	val, _ := json.Marshal(e)
+
+	val, err := json.Marshal(e)
+	if err != nil {
+		http.Error(w, "marshal error", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("publish: topic=%s kind=%s id=%s len=%d payload=%s",
+		topic, kind, e.ID, len(val), safePreview(val, 512))
 
 	ctxReq, cancelReq := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancelReq()
 
-	if err := writers[kind].WriteMessages(ctxReq, kafka.Message{
+	if err := writer.WriteMessages(ctxReq, kafka.Message{
 		Key:   []byte(e.ID),
 		Value: val,
+		Headers: []kafka.Header{
+			{Key: "content-type", Value: []byte("application/json")},
+			{Key: "event-type", Value: []byte(kind)},
+		},
 	}); err != nil {
 		log.Printf("produce error: topic=%s id=%s err=%v", topic, e.ID, err)
 		http.Error(w, "kafka write failed", http.StatusBadGateway)
@@ -203,8 +225,61 @@ func eventsHandler(w http.ResponseWriter, r *http.Request, writers map[string]*k
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Event-ID", e.ID)
 	w.WriteHeader(http.StatusCreated)
 	_, _ = w.Write([]byte(fmt.Sprintf(`{"status":"success","topic":"%s","id":"%s"}`, topic, e.ID)))
+}
+
+func consumeLoop(ctx context.Context, brokers []string, topic, group string) {
+	reader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:     brokers,
+		GroupID:     group,
+		Topic:       topic,
+		StartOffset: kafka.LastOffset, // c GroupID используется последний коммит группы
+		MinBytes:    1,
+		MaxBytes:    10e6,
+	})
+	defer reader.Close()
+
+	log.Printf("consumer started: topic=%s group=%s", topic, group)
+
+	for {
+		m, err := reader.ReadMessage(ctx)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return
+			}
+			log.Printf("consumer error: topic=%s err=%v", topic, err)
+			return
+		}
+
+		val := bytes.TrimSpace(m.Value)
+		if len(val) == 0 {
+			log.Printf("skip empty message: topic=%s partition=%d offset=%d key=%q ts=%s",
+				topic, m.Partition, m.Offset, string(m.Key), m.Time.Format(time.RFC3339))
+			continue
+		}
+		if !json.Valid(val) {
+			log.Printf("invalid json: topic=%s partition=%d offset=%d key=%q len=%d raw=%s",
+				topic, m.Partition, m.Offset, string(m.Key), len(val), safePreview(val, 256))
+			continue
+		}
+
+		var e Event
+		dec := json.NewDecoder(bytes.NewReader(val))
+		// dec.DisallowUnknownFields() // включай по желанию
+		if err := dec.Decode(&e); err != nil {
+			log.Printf("unmarshal error: topic=%s partition=%d offset=%d key=%q err=%v raw=%s",
+				topic, m.Partition, m.Offset, string(m.Key), err, safePreview(val, 256))
+			continue
+		}
+
+		log.Printf("consumed: topic=%s partition=%d offset=%d key=%q msgTs=%s eventTs=%s id=%s type=%s payload=%s",
+			topic, m.Partition, m.Offset, string(m.Key),
+			m.Time.Format(time.RFC3339),
+			e.Timestamp.Format(time.RFC3339),
+			e.ID, e.Type, safePreview(e.Payload, 256))
+	}
 }
 
 // extractKind разбирает путь и вытаскивает {kind} для /api/events/{kind} и /events/{kind}
@@ -252,35 +327,6 @@ func ioReadAllLimit(r io.Reader, limit int64) ([]byte, error) {
 		}
 	}
 	return []byte(b.String()), nil
-}
-
-func consumeLoop(ctx context.Context, brokers []string, topic, group string) {
-	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers:     brokers,
-		GroupID:     group,
-		Topic:       topic,
-		StartOffset: kafka.LastOffset, // читать новые сообщения
-		MinBytes:    1,
-		MaxBytes:    10e6,
-	})
-	defer reader.Close()
-	log.Printf("consumer started: topic=%s group=%s", topic, group)
-	for {
-		m, err := reader.ReadMessage(ctx)
-		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return
-			}
-			log.Printf("consumer error: topic=%s err=%v", topic, err)
-			return
-		}
-		var e Event
-		if err := json.Unmarshal(m.Value, &e); err != nil {
-			log.Printf("consume decode error: topic=%s err=%v", topic, err)
-			continue
-		}
-		log.Printf("consumed: topic=%s key=%s id=%s type=%s ts=%s payload=%s", topic, string(m.Key), e.ID, e.Type, e.Timestamp.Format(time.RFC3339), safePreview(e.Payload, 256))
-	}
 }
 
 func safePreview(b []byte, max int) string {
