@@ -15,7 +15,7 @@ data:
 
   # Service URLs
   MONOLITH_URL: "http://monolith:{{ .Values.monolith.service.port }}"
-  MOVIES_SERVICE_URL: "http://movies:{{ .Values.moviesService.service.port }}"
+  MOVIES_SERVICE_URL: "http://movies-service:{{ .Values.moviesService.service.port }}"
   
   # Strangler Fig configuration
   GRADUAL_MIGRATION: {{ .Values.config.gradualMigration | quote }}

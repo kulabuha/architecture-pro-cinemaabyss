@@ -25,7 +25,37 @@ spec:
     spec:
       containers:
       - name: events-service
-       .... тут
+        image: {{ .Values.eventsService.image.repository }}:{{ .Values.moviesService.image.tag }}
+        imagePullPolicy: {{ .Values.eventsService.image.pullPolicy }}
+        ports:
+        - containerPort: {{ .Values.eventsService.service.targetPort }}
+        env:
+        - name: PORT
+          value: "{{ .Values.eventsService.service.targetPort }}"
+        - name: DB_CONNECTION_STRING
+          value: "postgres://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)?sslmode=disable"
+        envFrom:
+        - configMapRef:
+            name: cinemaabyss-config
+        - secretRef:
+            name: cinemaabyss-secrets
+        resources:
+          {{- toYaml .Values.eventsService.resources | nindent 10 }}
+        readinessProbe:
+          httpGet:
+            path: /api/events/health
+            port: {{ .Values.eventsService.service.targetPort }}
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /api/events/health
+            port: {{ .Values.eventsService.service.targetPort }}
+          initialDelaySeconds: 15
+          periodSeconds: 20
+      restartPolicy: Always
+      imagePullSecrets:
+        - name: dockerconfigjson
 ---
 apiVersion: v1
 kind: Service
@@ -37,5 +67,10 @@ metadata:
     app.kubernetes.io/name: {{ include "cinemaabyss.name" . }}
     app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
- ........ и тут
+  selector:
+    app: events-service
+  ports:
+  - port: {{ .Values.eventsService.service.port }}
+    targetPort: {{ .Values.eventsService.service.targetPort }}
+  type: {{ .Values.eventsService.service.type }}
 {{- end }}

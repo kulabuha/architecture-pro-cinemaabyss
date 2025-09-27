@@ -5,7 +5,7 @@ global:
 
 # Image pull secrets
 imagePullSecrets:
-  dockerconfigjson: ewoJImF1dGhzIjogewoJCSJnaGNyLmlvIjogewoJCQkiYXV0aCI6
+  dockerconfigjson: ew0KICAgICJhdXRocyI6ICB7DQogICAgICAgICAgICAgICAgICAiZ2hjci5pbyI6ICB7DQogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgImF1dGgiOiAgImEzVnNZV0oxYUdFNloyaHdYMDl2V1ZWMVZVVlJUbE5DYzNBMmFrZFNhVE40WWt0eldtUktibVZzTVROYVRWRlhVZz09Ig0KICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgfQ0KICAgICAgICAgICAgICB9DQp9DQo=
 # Database configuration
 database:
   host: postgres
@@ -33,7 +33,7 @@ database:
 monolith:
   enabled: true
   image:
-    repository: ghcr.io/db-exp/cinemaabysstest/monolith
+    repository: ghcr.io/kulabuha/architecture-pro-cinemaabyss/monolith
     tag: latest
     pullPolicy: Always
   replicas: 1
@@ -53,7 +53,7 @@ monolith:
 proxyService:
   enabled: true
   image:
-    repository: ghcr.io/db-exp/cinemaabysstest/proxy-service
+    repository: ghcr.io/kulabuha/architecture-pro-cinemaabyss/proxy-service
     tag: latest
     pullPolicy: Always
   replicas: 1
@@ -73,7 +73,7 @@ proxyService:
 moviesService:
   enabled: true
   image:
-    repository: ghcr.io/db-exp/cinemaabysstest/movies-service
+    repository: ghcr.io/kulabuha/architecture-pro-cinemaabyss/movies-service
     tag: latest
     pullPolicy: Always
   replicas: 1
@@ -93,7 +93,7 @@ moviesService:
 eventsService:
   enabled: true
   image:
-    repository: ghcr.io/db-exp/cinemaabysstest/events-service
+    repository: ghcr.io/kulabuha/architecture-pro-cinemaabyss/events-service
     tag: latest
     pullPolicy: Always
   replicas: 1
