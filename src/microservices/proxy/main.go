@@ -208,6 +208,9 @@ func buildMux(cfg Config, client *http.Client) http.Handler {
 		_, _ = w.Write([]byte(`{"status":"true"}`))
 	})
 
+	mux.HandleFunc("/api/movies/health", func(w http.ResponseWriter, r *http.Request) {
+		singleHopProxy(client, w, r, movies, "/health", "movies")
+	})
 	// /api/movies -> либо монолит (/api/movies...), либо сервис (/movies...)
 	mux.HandleFunc("/api/movies", func(w http.ResponseWriter, r *http.Request) {
 		// оставляем любые методы как есть
@@ -246,6 +249,10 @@ func buildMux(cfg Config, client *http.Client) http.Handler {
 		singleHopProxy(client, w, r, monolith, r.URL.Path, "monolith")
 	})
 	mux.HandleFunc("/api/users/", func(w http.ResponseWriter, r *http.Request) {
+		singleHopProxy(client, w, r, monolith, r.URL.Path, "monolith")
+	})
+
+	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		singleHopProxy(client, w, r, monolith, r.URL.Path, "monolith")
 	})
 
