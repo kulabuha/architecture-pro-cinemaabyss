@@ -1,0 +1,88 @@
+@startuml
+' C4 Container diagram for CinemaAbyss
+!define RELATIVE_INCLUDE ./lib
+!include RELATIVE_INCLUDE/C4_Container.puml
+
+' People
+Person(user, "Пользователь", "Смотрит фильмы с веба/мобилки/TV")
+
+System_Boundary(ca, "CinemaAbyss") {
+  ' Client apps
+  Container(web,    "Web Client",        "Vue",            "UI (REST)")
+  Container(mobile, "Mobile App",        "iOS/Android",    "UI (REST)")
+  Container(tv,     "Smart TV App",      "Tizen/webOS",    "UI (REST)")
+
+  ' Edge
+  Container(gw,     "API Gateway",       "Go",             "JWT проверка, роутинг, rate limiting, трейсинг")
+
+  ' Core services
+  Container(auth,   "Auth Service",      "Go",             "Логин/регистрация, refresh, выдача JWT")
+  Container(users,  "Users & Subscriptions", "Go",         "Профили пользователей и статусы подписок; entitlement (право на просмотр)")
+  Container(pay,    "Payments",          "Go",             "Приём платежей, идемпотентность, вебхуки провайдера")
+  Container(meta,   "Metadata",          "Go",             "Каталог фильмов: жанры, актёры, поиск, рейтинги (single writer по рейтингам)")
+  Container(vid,    "Videos",            "Go",             "Выдача playback-URL, проверка доступа, интеграция с CDN/хранилищем")
+  Container(recs,   "Recommendations",   "Go",             "Интеграция с внешними провайдерами, кэш, фоллбек 'популярное'")
+  Container(mkt,    "Marketing",         "Go",             "Скидки/промокоды, правила ценообразования")
+  Container(bus,    "Event Bus",         "Kafka/NATS",     "Доменные события")
+
+  ' Data stores
+  ContainerDb(usersDb, "Users DB",     "PostgreSQL (schema users)",    "Профили, статусы подписок")
+  ContainerDb(payDb,   "Payments DB",  "PostgreSQL (schema payments)", "Платежи, ордера, вебхуки")
+  ContainerDb(metaDb,  "Metadata DB",  "PostgreSQL (schema metadata)", "Фильмы, жанры, актёры, рейтинги")
+  ContainerDb(vidDb,   "Videos DB",    "PostgreSQL (schema videos)",   "Ассеты, маппинги, статусы")
+  ContainerDb(mktDb,   "Marketing DB", "PostgreSQL (schema marketing)","Промокоды, правила")
+}
+
+' Externals
+System_Ext(cdn,      "CDN / Object Storage", "S3/CloudFront", "Хранение и раздача видео")
+System_Ext(payProv,  "Payment Provider",     "Stripe/Adyen/etc", "Эквайринг и вебхуки")
+System_Ext(recsProv, "External Recs Provider","",               "Внешний провайдер рекомендаций")
+
+' User flows
+Rel(user, web,    "Использует")
+Rel(user, mobile, "Использует")
+Rel(user, tv,     "Использует")
+
+Rel(web,    gw, "HTTPS REST/JSON")
+Rel(mobile, gw, "HTTPS REST/JSON")
+Rel(tv,     gw, "HTTPS REST/JSON")
+
+' Gateway routing
+Rel(gw, auth,  "Логин/refresh, верификация токена")
+Rel(gw, users, "Профиль, entitlement")
+Rel(gw, meta,  "Каталог/поиск")
+Rel(gw, vid,   "Запрос playback-URL")
+Rel(gw, recs,  "Получить рекомендации")
+Rel(gw, mkt,   "Проверка промокода/цен")
+Rel(gw, pay,   "Создание платежа/интента")
+
+' Service-to-service (internal)
+Rel(vid, users, "Проверка права на просмотр (sync)")
+Rel(vid, cdn,   "Выдаёт подписанный URL (TTL) для чтения", "HTTPS")
+
+Rel(auth, usersDb, "CRUD учётных записей")
+Rel(users, usersDb, "CRUD профилей и подписок")
+Rel(meta,  metaDb,  "CRUD метаданных и рейтингов")
+Rel(vid,   vidDb,   "CRUD ассетов/маппингов")
+Rel(mkt,   mktDb,   "CRUD промо")
+Rel(pay,   payDb,   "CRUD платежей/ордеров")
+
+' Payments & provider
+Rel(pay, payProv,   "Создание/подтверждение оплаты", "HTTPS")
+Rel(payProv, pay,   "Вебхук: оплата успешна/ошибка",  "HTTPS")
+Rel(pay, mkt,       "Валидация промо/цены (при оплате)")
+
+' Recommendations & provider
+Rel(recs, recsProv, "Получить рекомендации/фичи", "HTTPS")
+Rel(recs, meta,     "Запрос каталожных данных (enrichment)")
+
+' Events (pub/sub — описаны стрелками через шину)
+Rel(pay,  bus,   "Публикует: PaymentSucceeded/Failed")
+Rel(bus,  users, "Подписка: Payment → обновить статус подписки")
+Rel(users,bus,   "Публикует: SubscriptionActivated/Expired")
+Rel(meta, bus,   "Публикует: RatingGiven")
+Rel(bus,  recs,  "Подписка: RatingGiven → обновить кэш/модель")
+Rel(vid,  bus,   "Публикует: VideoReady")
+Rel(bus,  meta,  "Подписка: VideoReady → обновить карточку фильма")
+
+@enduml
