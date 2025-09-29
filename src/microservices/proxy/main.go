@@ -2,41 +2,38 @@ package main
 
 import (
 	"context"
-	crand "crypto/rand"
+	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"io"
 	"log"
-	mrand "math/rand"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
 )
 
 type Config struct {
-	Port                   string
-	MonolithURL            string
-	MoviesServiceURL       string
-	EventsServiceURL       string
-	GradualMigration       bool
-	MoviesMigrationPercent int
-	ClientTimeout          time.Duration
+	Port                 string
+	MonolithURL          string
+	MoviesServiceURL     string
+	EventsServiceURL     string
+	RouteMoviesToService bool
+	ClientTimeout        time.Duration
 }
 
-func getEnv(k, def string) string {
+func getenv(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
 	}
 	return def
 }
 
-func parseBoolEnv(k string, def bool) bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv(k)))
+func parseBool(k string, def bool) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(k)))
 	if v == "" {
 		return def
 	}
@@ -50,45 +47,25 @@ func parseBoolEnv(k string, def bool) bool {
 	}
 }
 
-func parseIntBounded(k string, def, min, max int) int {
-	v := strings.TrimSpace(os.Getenv(k))
-	if v == "" {
-		return def
-	}
-	i, err := strconv.Atoi(v)
+func mustParseURL(raw string) *url.URL {
+	u, err := url.Parse(raw)
 	if err != nil {
-		return def
+		log.Fatalf("bad URL %q: %v", raw, err)
 	}
-	if i < min {
-		return min
-	}
-	if i > max {
-		return max
-	}
-	return i
+	return u
 }
 
-func loadConfig() (Config, error) {
-	cfg := Config{
-		Port:                   getEnv("PORT", "8000"),
-		MonolithURL:            getEnv("MONOLITH_URL", "http://localhost:8080"),
-		MoviesServiceURL:       getEnv("MOVIES_SERVICE_URL", "http://localhost:8081"),
-		EventsServiceURL:       getEnv("EVENTS_SERVICE_URL", "http://localhost:8082"),
-		GradualMigration:       parseBoolEnv("GRADUAL_MIGRATION", false),
-		MoviesMigrationPercent: parseIntBounded("MOVIES_MIGRATION_PERCENT", 0, 0, 100),
-		ClientTimeout:          3 * time.Second,
+func loadConfig() Config {
+	return Config{
+		Port:                 getenv("PORT", "8000"),
+		MonolithURL:          getenv("MONOLITH_URL", "http://localhost:8080"),
+		MoviesServiceURL:     getenv("MOVIES_SERVICE_URL", "http://localhost:8081"),
+		EventsServiceURL:     getenv("EVENTS_SERVICE_URL", "http://localhost:8082"),
+		RouteMoviesToService: parseBool("ROUTE_MOVIES_TO_SERVICE", false),
+		ClientTimeout:        5 * time.Second,
 	}
-	// validate base URLs
-	if _, err := url.ParseRequestURI(cfg.MonolithURL); err != nil {
-		return cfg, errors.New("invalid MONOLITH_URL")
-	}
-	if _, err := url.ParseRequestURI(cfg.MoviesServiceURL); err != nil {
-		return cfg, errors.New("invalid MOVIES_SERVICE_URL")
-	}
-	return cfg, nil
 }
 
-// request-scoped context key
 type ctxKey string
 
 const (
@@ -96,56 +73,50 @@ const (
 	ctxKeyRoute ctxKey = "route"
 )
 
-// generateRequestID returns a 16-byte hex string.
-func generateRequestID() string {
+func genReqID() string {
 	b := make([]byte, 16)
-	if _, err := crand.Read(b); err != nil {
-		for i := range b {
-			b[i] = byte(mrand.Intn(256))
-		}
+	if _, err := rand.Read(b); err != nil {
+		// крайне маловероятно
+		ts := time.Now().UnixNano()
+		return hex.EncodeToString([]byte{
+			byte(ts >> 56), byte(ts >> 48), byte(ts >> 40), byte(ts >> 32),
+			byte(ts >> 24), byte(ts >> 16), byte(ts >> 8), byte(ts),
+		})
 	}
 	return hex.EncodeToString(b)
 }
 
-// responseWriter wrapper to capture status and bytes written
-
 type statusWriter struct {
-	w          http.ResponseWriter
-	statusCode int
-	bytes      int
+	http.ResponseWriter
+	status int
+	bytes  int
 }
 
-func (sw *statusWriter) Header() http.Header { return sw.w.Header() }
-func (sw *statusWriter) Write(b []byte) (int, error) {
-	n, err := sw.w.Write(b)
-	sw.bytes += n
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+func (w *statusWriter) Write(b []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(b)
+	w.bytes += n
 	return n, err
 }
-func (sw *statusWriter) WriteHeader(statusCode int) {
-	sw.statusCode = statusCode
-	sw.w.WriteHeader(statusCode)
-}
-func newStatusWriter(w http.ResponseWriter) *statusWriter {
-	return &statusWriter{w: w, statusCode: http.StatusOK}
-}
 
-// middleware: inject/request Request-ID and logging
 func withRequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		reqID := r.Header.Get("X-Request-ID")
-		if reqID == "" {
-			reqID = generateRequestID()
+		id := r.Header.Get("X-Request-ID")
+		if id == "" {
+			id = genReqID()
 		}
-		w.Header().Set("X-Request-ID", reqID)
-		r = r.WithContext(context.WithValue(r.Context(), ctxKeyReqID, reqID))
-		next.ServeHTTP(w, r)
+		w.Header().Set("X-Request-ID", id)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKeyReqID, id)))
 	})
 }
 
 func withLogging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		sw := newStatusWriter(w)
+		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(sw, r)
 		reqID, _ := r.Context().Value(ctxKeyReqID).(string)
 		route, _ := r.Context().Value(ctxKeyRoute).(string)
@@ -153,173 +124,133 @@ func withLogging(next http.Handler) http.Handler {
 			route = "-"
 		}
 		log.Printf("ts=%s method=%s path=%s status=%d dur_ms=%d req_id=%s route=%s bytes=%d",
-			start.Format(time.RFC3339), r.Method, r.URL.Path, sw.statusCode, time.Since(start).Milliseconds(), reqID, route, sw.bytes,
-		)
+			start.Format(time.RFC3339), r.Method, r.URL.Path, sw.status, time.Since(start).Milliseconds(), reqID, route, sw.bytes)
 	})
 }
 
-// upstream chooser for movies: returns baseURL and route label
-func chooseMoviesUpstream(cfg Config) (base string, route string) {
-	if cfg.GradualMigration && cfg.MoviesMigrationPercent > 0 {
-		if mrand.Intn(100) < cfg.MoviesMigrationPercent {
-			return cfg.MoviesServiceURL, "movies"
-		}
-	}
-	return cfg.MonolithURL, "monolith"
+// hop-by-hop заголовки, которые нельзя проксировать дальше
+var hopByHop = map[string]struct{}{
+	"Connection":          {},
+	"Proxy-Connection":    {},
+	"Keep-Alive":          {},
+	"Proxy-Authenticate":  {},
+	"Proxy-Authorization": {},
+	"Te":                  {},
+	"Trailer":             {},
+	"Transfer-Encoding":   {},
+	"Upgrade":             {},
 }
 
-// minimal header allowlist to propagate
-var passHeaders = []string{"Authorization", "X-Request-ID", "X-User-ID"}
+func copyHeaders(dst, src http.Header) {
+	for k, vv := range src {
+		if _, skip := hopByHop[k]; skip {
+			continue
+		}
+		for _, v := range vv {
+			dst.Add(k, v)
+		}
+	}
+}
 
-// proxyTryPaths tries several upstream paths, falling back on 404/405
-func proxyTryPaths(client *http.Client, w http.ResponseWriter, r *http.Request, upstreamBase string, paths []string) {
-	for i, p := range paths {
-		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+func singleHopProxy(client *http.Client, w http.ResponseWriter, r *http.Request, base *url.URL, outPath string, routeLabel string) {
+	ctx := r.Context()
+	reqURL := *base // копия
+	reqURL.Path = outPath
+	reqURL.RawQuery = r.URL.RawQuery
 
-		u, err := url.Parse(upstreamBase)
-		if err != nil {
-			cancel()
-			http.Error(w, "bad upstream base", http.StatusBadGateway)
-			return
-		}
-		joined, err := url.JoinPath(u.Path, p)
-		if err != nil {
-			cancel()
-			http.Error(w, "bad upstream path", http.StatusBadGateway)
-			return
-		}
-		u.Path = joined
-		u.RawQuery = r.URL.RawQuery
-		log.Printf("proxy -> %s", u.String())
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-		if err != nil {
-			cancel()
-			http.Error(w, "cannot build upstream request", http.StatusBadGateway)
-			return
-		}
-		for _, h := range passHeaders {
-			if v := r.Header.Get(h); v != "" {
-				req.Header.Set(h, v)
-			}
-		}
-
-		resp, err := client.Do(req)
-		if err != nil {
-			cancel()
-			if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "context deadline exceeded") {
-				http.Error(w, "upstream timeout", http.StatusGatewayTimeout)
-				return
-			}
-			http.Error(w, "upstream error", http.StatusBadGateway)
-			return
-		}
-
-		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
-			_ = resp.Body.Close()
-			cancel()
-			if i < len(paths)-1 {
-				continue
-			}
-			w.WriteHeader(resp.StatusCode)
-			return
-		}
-
-		if ct := resp.Header.Get("Content-Type"); ct != "" {
-			w.Header().Set("Content-Type", ct)
-		}
-		if cc := resp.Header.Get("Cache-Control"); cc != "" {
-			w.Header().Set("Cache-Control", cc)
-		}
-		if etag := resp.Header.Get("ETag"); etag != "" {
-			w.Header().Set("ETag", etag)
-		}
-		if lm := resp.Header.Get("Last-Modified"); lm != "" {
-			w.Header().Set("Last-Modified", lm)
-		}
-		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
-		resp.Body.Close()
-		cancel()
+	// Тело запроса (если есть) мы просто протаскиваем дальше
+	req, err := http.NewRequestWithContext(ctx, r.Method, reqURL.String(), r.Body)
+	if err != nil {
+		http.Error(w, "build upstream request error", http.StatusBadGateway)
 		return
 	}
+	copyHeaders(req.Header, r.Header)
+	// X-Forwarded-* метки
+	req.Header.Set("X-Forwarded-Host", r.Host)
+	req.Header.Set("X-Forwarded-Proto", "http")
+
+	// Проставим роут в контекст для логов
+	r = r.WithContext(context.WithValue(ctx, ctxKeyRoute, routeLabel))
+	w.Header().Set("X-Backend", routeLabel)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		// различать таймаут необязательно для учебного проекта
+		http.Error(w, "upstream error", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	for k, vv := range resp.Header {
+		if _, skip := hopByHop[k]; skip {
+			continue
+		}
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
 }
 
-// buildMux constructs the HTTP handler tree so we can unit-test routing easily.
 func buildMux(cfg Config, client *http.Client) http.Handler {
+	monolith := mustParseURL(cfg.MonolithURL)
+	movies := mustParseURL(cfg.MoviesServiceURL)
+	events := mustParseURL(cfg.EventsServiceURL)
+
 	mux := http.NewServeMux()
 
-	// /health
+	// health
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			w.Header().Set("Allow", http.MethodGet)
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
+		_, _ = w.Write([]byte(`{"status":"true"}`))
 	})
 
-	// movies handler (supports both /api/movies and /api/movies/..)
-	moviesHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			w.Header().Set("Allow", http.MethodGet)
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	// /api/movies -> либо монолит (/api/movies...), либо сервис (/movies...)
+	mux.HandleFunc("/api/movies", func(w http.ResponseWriter, r *http.Request) {
+		// оставляем любые методы как есть
+		inPath := r.URL.Path
+		suffix := strings.TrimPrefix(inPath, "/api/movies") // включая возможный хвост /...
+		if cfg.RouteMoviesToService {
+			out := "/movies" + suffix
+			singleHopProxy(client, w, r, movies, out, "movies")
 			return
 		}
-		base, route := chooseMoviesUpstream(cfg)
-		r = r.WithContext(context.WithValue(r.Context(), ctxKeyRoute, route))
-		w.Header().Set("X-Backend", route)
-
-		paths := []string{"/api/movies", "/movies"}
-		if route == "movies" {
-			paths = []string{"/movies", "/api/movies"}
-		}
-		proxyTryPaths(client, w, r, base, paths)
+		out := "/api/movies" + suffix
+		singleHopProxy(client, w, r, monolith, out, "monolith")
 	})
-	mux.Handle("/api/movies", moviesHandler)
-	mux.Handle("/api/movies/", moviesHandler)
-
-	// users (always monolith for now)
-	usersHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			w.Header().Set("Allow", http.MethodGet)
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	mux.HandleFunc("/api/movies/", func(w http.ResponseWriter, r *http.Request) {
+		inPath := r.URL.Path
+		suffix := strings.TrimPrefix(inPath, "/api/movies")
+		if cfg.RouteMoviesToService {
+			out := "/movies" + suffix
+			singleHopProxy(client, w, r, mustParseURL(cfg.MoviesServiceURL), out, "movies")
 			return
 		}
-		r = r.WithContext(context.WithValue(r.Context(), ctxKeyRoute, "monolith"))
-		w.Header().Set("X-Backend", "monolith")
-		// pass through as-is
-		u, _ := url.Parse(cfg.MonolithURL)
-		joined, _ := url.JoinPath(u.Path, "/api/users")
-		u.Path = joined
-		u.RawQuery = r.URL.RawQuery
-		req, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, u.String(), nil)
-		for _, h := range passHeaders {
-			if v := r.Header.Get(h); v != "" {
-				req.Header.Set(h, v)
-			}
-		}
-		resp, err := client.Do(req)
-		if err != nil {
-			http.Error(w, "upstream error", http.StatusBadGateway)
-			return
-		}
-		defer resp.Body.Close()
-		if ct := resp.Header.Get("Content-Type"); ct != "" {
-			w.Header().Set("Content-Type", ct)
-		}
-		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
+		out := "/api/movies" + suffix
+		singleHopProxy(client, w, r, mustParseURL(cfg.MonolithURL), out, "monolith")
 	})
-	mux.Handle("/api/users", usersHandler)
-	mux.Handle("/api/users/", usersHandler)
 
-	// custom NotFound with log
+	// /api/events -> всегда на events-service, путь сохраняем как есть
+	mux.HandleFunc("/api/events", func(w http.ResponseWriter, r *http.Request) {
+		singleHopProxy(client, w, r, events, r.URL.Path, "events")
+	})
+	mux.HandleFunc("/api/events/", func(w http.ResponseWriter, r *http.Request) {
+		singleHopProxy(client, w, r, events, r.URL.Path, "events")
+	})
+
+	// /api/users -> всегда на монолит, путь сохраняем как есть
+	mux.HandleFunc("/api/users", func(w http.ResponseWriter, r *http.Request) {
+		singleHopProxy(client, w, r, monolith, r.URL.Path, "monolith")
+	})
+	mux.HandleFunc("/api/users/", func(w http.ResponseWriter, r *http.Request) {
+		singleHopProxy(client, w, r, monolith, r.URL.Path, "monolith")
+	})
+
+	// дефолт — 404 как раньше
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("NotFound path=%s", r.URL.Path)
 		http.NotFound(w, r)
 	})
 
@@ -327,24 +258,30 @@ func buildMux(cfg Config, client *http.Client) http.Handler {
 }
 
 func main() {
-	// seed RNG for gradual migration
-	mrand.Seed(time.Now().UnixNano())
-
-	cfg, err := loadConfig()
-	if err != nil {
-		log.Fatalf("config error: %v", err)
-	}
-	log.Printf("starting proxy-service on :%s (gradual=%v percent=%d) monolith=%s movies=%s",
-		cfg.Port, cfg.GradualMigration, cfg.MoviesMigrationPercent, cfg.MonolithURL, cfg.MoviesServiceURL,
+	cfg := loadConfig()
+	log.Printf("proxy-service :%s route_movies_to_service=%v monolith=%s movies=%s events=%s",
+		cfg.Port, cfg.RouteMoviesToService, cfg.MonolithURL, cfg.MoviesServiceURL, cfg.EventsServiceURL,
 	)
 
-	client := &http.Client{Timeout: cfg.ClientTimeout, Transport: &http.Transport{MaxIdleConns: 100, MaxIdleConnsPerHost: 100, IdleConnTimeout: 90 * time.Second}}
+	client := &http.Client{
+		Timeout: cfg.ClientTimeout,
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 100,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
 
 	root := buildMux(cfg, client)
+	srv := &http.Server{
+		Addr:              ":" + cfg.Port,
+		Handler:           root,
+		ReadHeaderTimeout: 2 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 
-	srv := &http.Server{Addr: ":" + cfg.Port, Handler: root, ReadHeaderTimeout: 2 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
-
-	// graceful shutdown
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -352,7 +289,7 @@ func main() {
 		log.Println("shutdown signal received")
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := srv.Shutdown(ctx); err != nil {
+		if err := srv.Shutdown(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("server shutdown error: %v", err)
 		} else {
 			log.Println("server stopped gracefully")
